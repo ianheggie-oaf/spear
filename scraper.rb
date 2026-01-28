@@ -1,4 +1,4 @@
-require 'scraperwiki'
+require "scraperwiki"
 require "httparty"
 
 # Password required to get token
@@ -30,46 +30,77 @@ def applications_page(authority_id, start_row, headers)
     }
   }
 
+  application_list_url = "https://www.spear.land.vic.gov.au/spear/api/v1/applicationlist/publicSearch"
   applications = HTTParty.post(
-    "https://www.spear.land.vic.gov.au/spear/api/v1/applicationlist/publicSearch",
+    application_list_url,
     body: query.to_json,
     headers: headers
   )
 
-  applications["data"]["resultRows"].each do |a|
-    if a["submittedDate"].nil?
-      puts "SubmittedDate is empty for #{a['spearReference']}. So, skipping."
+  # Process a page of applications
+  rows = applications&.dig("data", "resultRows")
+  if rows.nil?
+    puts "Error: unable to find rows from #{application_list_url}"
+    return
+  end
+
+  expected_count = applications&.dig('data', 'numFound').to_i
+  if rows.size == expected_count
+    puts "Found #{rows.size} rows of applications from #{application_list_url}"
+  else
+    puts "WARNING: Found #{rows.size} rows of applications from #{application_list_url}, expected #{expected_count}"
+  end
+
+  rows.each do |a|
+    spear_reference = a["spearReference"]
+    if spear_reference.nil?
+      puts "Error: spear_reference is empty - skipping record from #{application_list_url}"
       next
     end
 
-    # We need to get more detailed information to get the application id (for
-    # the info_url) and a half-way decent description
+    if a["submittedDate"].nil?
+      puts "Error: SubmittedDate is empty for #{spear_reference} - skipping record from #{application_list_url}"
+      next
+    end
+
+    # We need to get more detailed information to get the application id (for the info_url) and
+    # a half-way decent description.
     # This requires two more API calls. Ugh.
-
+    application_url = "https://www.spear.land.vic.gov.au/spear/api/v1/applications/retrieve/#{spear_reference}?publicView=true"
     result = HTTParty.get(
-      "https://www.spear.land.vic.gov.au/spear/api/v1/applications/retrieve/#{a['spearReference']}?publicView=true",
+      application_url,
       headers: headers
     )
-    application_id = result["data"]["applicationId"]
-
+    application_id = result["data"]&.dig("applicationId")
+    if application_id.nil?
+      puts "Error: Missing application_id for #{spear_reference} - skipping record from #{application_url}"
+      next
+    end
+    detail_url = "https://www.spear.land.vic.gov.au/spear/api/v1/applications/#{application_id}/summary?publicView=true"
     detail = HTTParty.get(
-      "https://www.spear.land.vic.gov.au/spear/api/v1/applications/#{application_id}/summary?publicView=true",
+      detail_url,
       headers: headers
     )
-    if detail && detail["data"] 
-      yield(
-        "council_reference" => a["spearReference"],
-        "address" => a["property"],
-        "description" => detail["data"]["intendedUse"].to_s, # Converts nil to an empty string - avoid type mismatch
-        "info_url" => "https://www.spear.land.vic.gov.au/spear/app/public/applications/#{application_id}/summary",
-        "date_scraped" => Date.today.to_s,
-        "date_received" => Date.strptime(a["submittedDate"], "%d/%m/%Y").to_s
-      )
-    else
-      puts "Skipping #{a['spearReference']} due to missing detail data."
-end
 
-  [applications["data"]["resultRows"].count, applications["data"]["numFound"]]
+    unless detail&.dig("data")
+      puts "Error: Missing detail data for #{spear_reference} - skipping record from #{detail_url}"
+      next
+    end
+    
+    description = detail&.dig("data", "intendedUse").to_s
+    if description.empty?
+      puts "WARNING: missing description for #{spear_reference} - from #{application_list_url}"
+    end
+    
+    yield(
+      "council_reference" => a["spearReference"],
+      "address" => a["property"],
+      "description" => description,
+      "info_url" => "https://www.spear.land.vic.gov.au/spear/app/public/applications/#{application_id}/summary",
+      "date_scraped" => Date.today.to_s,
+      "date_received" => Date.strptime(a["submittedDate"], "%d/%m/%Y").to_s
+    )
+  end
 end
 
 def all_applications(authority_id, headers)
@@ -87,7 +118,7 @@ end
 tokens = HTTParty.post(
   "https://www.spear.land.vic.gov.au/spear/api/v1/oauth/token",
   body: "username=public&password=&grant_type=password&client_id=clientapp&scope=spear_rest_api",
-  headers: { "Authorization" => "Basic #{BASIC_AUTH_FOR_TOKEN}"}
+  headers: { "Authorization" => "Basic #{BASIC_AUTH_FOR_TOKEN}" }
 )
 
 headers = {
@@ -101,7 +132,12 @@ authorities = HTTParty.post(
   headers: headers
 )
 
+puts "Found #{authorities["data"].size} authorities ..."
+
 authorities["data"].each do |authority|
+  next if ENV['MORPH_AUTHORITIES'] && !ENV['MORPH_AUTHORITIES'].split(',').include?(authority['name'])
+
+  puts
   puts "Getting applications for #{authority['name']}..."
   id = authority["id"]
 
@@ -109,7 +145,8 @@ authorities["data"].each do |authority|
     # We only want the last 28 days
     break if Date.parse(record["date_received"]) < Date.today - 28
 
-    puts "Saving #{record['council_reference']}..."
+    puts "Saving #{record['council_reference']} - #{record['address']} ..."
     ScraperWiki.save_sqlite(["council_reference"], record)
   end
 end
+puts "Finished!"

@@ -3,6 +3,7 @@
 
 require "scraperwiki"
 require "httparty"
+require "yaml"
 
 class Scraper
   # Password required to get token
@@ -11,7 +12,7 @@ class Scraper
   # Throttle block to be nice to servers we are scraping
   def throttle_block(extra_delay: 0.5)
     if @pause_duration
-      puts "  Pausing #{@pause_duration}s"
+      puts "  Pausing #{@pause_duration}s" if ENV["DEBUG"] || ENV["MORPH_DEBUG"]
       sleep(@pause_duration)
     end
     start_time = Time.now.to_f
@@ -38,7 +39,7 @@ class Scraper
     puts "Deleting #{deleted_count} applications scraped between #{oldest_date} and #{cutoff_date}"
     ScraperWiki.sqliteexecute("DELETE FROM data WHERE date_scraped < ?", [cutoff_date])
 
-    # VACUUM roughly once each 33 days or if older than 35 days (first time) or if VACUUM is set
+    # VACUUM roughly once each 33 days, or if older than 35 days (first time), or if VACUUM is set
     return unless rand < 0.03 || (oldest_date && oldest_date < vacuum_cutoff_date) || ENV["VACUUM"]
 
     puts "  Running VACUUM to reclaim space..."
@@ -72,35 +73,39 @@ class Scraper
     }
 
     application_list_url = "https://www.spear.land.vic.gov.au/spear/api/v1/applicationlist/publicSearch"
-    applications = HTTParty.post(
-      application_list_url,
-      body: query.to_json,
-      headers: headers
-    )
+    applications = throttle_block do
+      HTTParty.post(
+        application_list_url,
+        body: query.to_json,
+        headers: headers
+      )
+    end
 
     # Process a page of applications
     rows = applications&.dig("data", "resultRows")
     if rows.nil?
-      puts "Error: unable to find rows from #{application_list_url}"
-      return
+      puts "ERROR: unable to find rows from #{application_list_url} - aborting this authority"
+      puts "DOM element: #{applications.inspect}" if ENV["DEBUG"]
+      return [0, 0]
     end
 
-    expected_count = applications&.dig("data", "numFound").to_i
-    if rows.size == expected_count
-      puts "Found #{rows.size} rows of applications from #{application_list_url}"
-    else
-      puts "WARNING: Found #{rows.size} rows of applications from #{application_list_url}, expected #{expected_count}"
+    number_on_page = rows.size
+    total_no = applications&.dig("data", "numFound").to_i
+    if ENV["DEBUG"]
+      puts "Found #{number_on_page} rows, starting from #{start_row} out of #{total_no - start_row} left of applications from #{application_list_url}"
     end
 
     rows.each do |a|
       spear_reference = a["spearReference"]
       if spear_reference.nil?
-        puts "Error: spear_reference is empty - skipping record from #{application_list_url}"
+        puts "ERROR: spear_reference is empty - skipping record from #{application_list_url}"
+        puts "DOM element: #{a.inspect}" if ENV["DEBUG"]
         next
       end
 
       if a["submittedDate"].nil?
-        puts "Error: SubmittedDate is empty for #{spear_reference} - skipping record from #{application_list_url}"
+        puts "ERROR: SubmittedDate is empty for #{spear_reference} - skipping record from #{application_list_url}"
+        puts "DOM element: #{a.inspect}" if ENV["DEBUG"]
         next
       end
 
@@ -108,28 +113,45 @@ class Scraper
       # a half-way decent description.
       # This requires two more API calls. Ugh.
       application_url = "https://www.spear.land.vic.gov.au/spear/api/v1/applications/retrieve/#{spear_reference}?publicView=true"
-      result = HTTParty.get(
-        application_url,
-        headers: headers
-      )
+      result = throttle_block do
+        HTTParty.get(
+          application_url,
+          headers: headers
+        )
+      end
       application_id = result["data"]&.dig("applicationId")
       if application_id.nil?
-        puts "Error: Missing application_id for #{spear_reference} - skipping record from #{application_url}"
+        puts "ERROR: Missing application_id for #{spear_reference} - skipping record from #{application_url}"
+        puts "HTTParty response: #{result.inspect}" if ENV["DEBUG"]
         next
       end
       detail_url = "https://www.spear.land.vic.gov.au/spear/api/v1/applications/#{application_id}/summary?publicView=true"
-      detail = HTTParty.get(
-        detail_url,
-        headers: headers
-      )
+      detail = throttle_block do
+        HTTParty.get(
+          detail_url,
+          headers: headers
+        )
+      end
 
       unless detail&.dig("data")
-        puts "Error: Missing detail data for #{spear_reference} - skipping record from #{detail_url}"
+        puts "ERROR: Missing detail data for #{spear_reference} - skipping record from #{detail_url}"
+        puts "HTTParty response: #{detail.inspect}" if ENV["DEBUG"]
         next
       end
 
       description = detail&.dig("data", "intendedUse").to_s
-      puts "WARNING: missing description for #{spear_reference} - from #{application_list_url}" if description.empty?
+      if description.empty?
+        puts "NOTE: Missing Intended Use for #{spear_reference}, using Proposal Type and Application Type instead for description"
+        # puts "HTTParty response: #{detail.to_yaml}" if ENV['DEBUG']
+        description = [
+          detail&.dig("data", "appDisplayName"),
+          detail&.dig("data", "propsalTypeDisplay"),
+        ].flatten.compact.join(".\n")
+      end
+      if description.empty?
+        puts "WARNING: missing description for #{spear_reference} - from #{detail_url}"
+        puts "HTTParty response: #{detail.inspect}" if ENV["DEBUG"]
+      end
 
       yield(
         "council_reference" => a["spearReference"],
@@ -140,38 +162,47 @@ class Scraper
         "date_received" => Date.strptime(a["submittedDate"], "%d/%m/%Y").to_s
       )
     end
+    [number_on_page, total_no]
   end
 
   def all_applications(authority_id, headers, &block)
     start_row = 0
 
     loop do
+      puts
+      puts "  Getting row #{start_row} onwards for #{authority_id}..." if ENV["DEBUG"]
       number_on_page, total_no = applications_page(authority_id, start_row, headers, &block)
+      puts "  Found #{number_on_page} applications from #{authority_id}, total no = #{total_no}" if ENV["DEBUG"]
       start_row += number_on_page
       break if start_row >= total_no
     end
   end
 
   def run
-    tokens = HTTParty.post(
-      "https://www.spear.land.vic.gov.au/spear/api/v1/oauth/token",
-      body: "username=public&password=&grant_type=password&client_id=clientapp&scope=spear_rest_api",
-      headers: { "Authorization" => "Basic #{BASIC_AUTH_FOR_TOKEN}" }
-    )
+    puts "Getting list of Authorities..."
+    tokens = throttle_block do
+      HTTParty.post(
+        "https://www.spear.land.vic.gov.au/spear/api/v1/oauth/token",
+        body: "username=public&password=&grant_type=password&client_id=clientapp&scope=spear_rest_api",
+        headers: { "Authorization" => "Basic #{BASIC_AUTH_FOR_TOKEN}" }
+      )
+    end
 
     headers = {
       "Authorization" => "Bearer #{tokens['access_token']}",
       "Content-Type" => "application/json",
     }
 
-    authorities = HTTParty.post(
-      "https://www.spear.land.vic.gov.au/spear/api/v1/site/search",
-      body: '{"data":{"searchType":"publicsearch","searchTypeFilter":"all","searchText":null,"showInactiveSites":false}}',
-      headers: headers
-    )
+    authorities = throttle_block do
+      HTTParty.post(
+        "https://www.spear.land.vic.gov.au/spear/api/v1/site/search",
+        body: '{"data":{"searchType":"publicsearch","searchTypeFilter":"all","searchText":null,"showInactiveSites":false}}',
+        headers: headers
+      )
+    end
 
-    puts "Found #{authorities['data'].size} authorities ..."
-
+    puts "Found #{authorities['data'].size} authorities..."
+    counts = {}
     authorities["data"].each do |authority|
       next if ENV["MORPH_AUTHORITIES"] && !ENV["MORPH_AUTHORITIES"].split(",").include?(authority["name"])
 
@@ -180,13 +211,28 @@ class Scraper
       id = authority["id"]
 
       all_applications(id, headers) do |record|
+        counts[authority["name"]] ||= 0
         # We only want the last 28 days
-        break if Date.parse(record["date_received"]) < Date.today - 28
+        if Date.parse(record["date_received"]) < Date.today - 28
+          puts "  Ignoring remaining rows received #{record['date_received']} and earlier ..."
+          break
+        end
 
         puts "Saving #{record['council_reference']} - #{record['address']} ..."
+        puts record.to_yaml if ENV["DEBUG"]
+        counts[authority["name"]] += 1
         ScraperWiki.save_sqlite(["council_reference"], record)
       end
     end
+    puts
+    puts "Count  Authority"
+    puts "-----  --------------------------------------"
+    authorities["data"].each do |authority|
+      name = authority["name"]
+      puts "#{counts[name] ? format('%5d', counts[name]) : '    -'}  #{name}"
+    end
+    puts
+    cleanup_old_records
     puts "Finished!"
   end
 end

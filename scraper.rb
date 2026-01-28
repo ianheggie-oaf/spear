@@ -9,7 +9,8 @@ class Scraper
   # Password required to get token
   BASIC_AUTH_FOR_TOKEN = "Y2xpZW50YXBwOg=="
   DAYS_WARNING = 60
-  AUTH_TIMEOUT = 600  # 10 minutes in seconds (conservative)
+  AUTH_TIMEOUT = 600 # 10 minutes in seconds (conservative)
+  STATE_PLANNING_MINISTER = "Minister for Planning" # historical?
 
   # Throttle block to be nice to servers we are scraping
   def throttle_block(extra_delay: 0.5)
@@ -173,7 +174,6 @@ class Scraper
     start_row = 0
 
     loop do
-      puts
       puts "  Getting row #{start_row} onwards for #{authority_id}..." if ENV["DEBUG"]
       number_on_page, total_no = applications_page(authority_id, start_row, &block)
       puts "  Found #{number_on_page} applications from #{authority_id}, total no = #{total_no}" if ENV["DEBUG"]
@@ -199,15 +199,14 @@ class Scraper
     authorities["data"].each do |authority|
       next if ENV["MORPH_AUTHORITIES"] && !ENV["MORPH_AUTHORITIES"].split(",").include?(authority["name"])
 
-      puts
       puts "Getting applications for #{authority['name']}..."
       id = authority["id"]
 
       all_applications(id) do |record|
         date_received = Date.parse(record["date_received"])
         most_recent_entry[authority["name"]] ||= date_received
-        if date_received < Date.today - DAYS_WARNING
-          puts "WARNING: nothing found between 28 and #{DAYS_WARNING} ago! previous SPEAR record dated #{record['date_received']}"
+        if date_received < Date.today - DAYS_WARNING && !authority["name"].include?(STATE_PLANNING_MINISTER)
+          puts "WARNING: nothing found between 28 and #{DAYS_WARNING} days ago! previous SPEAR record dated #{record['date_received']}"
         else
           counts[authority["name"]] ||= 0
         end
@@ -217,8 +216,8 @@ class Scraper
           break
         end
 
-        puts "Saving #{record['council_reference']} - #{record['address']} ..."
-        puts record.to_yaml if ENV["DEBUG"]
+        puts "Saving #{record['council_reference']} - #{record['address']}"
+        puts record.to_yaml, "" if ENV["DEBUG"]
         counts[authority["name"]] += 1
         ScraperWiki.save_sqlite(["council_reference"], record)
       end
@@ -228,7 +227,11 @@ class Scraper
     puts "-----  --------------------------------------"
     authorities["data"].each do |authority|
       name = authority["name"]
-      puts "#{counts[name] ? format('%5d', counts[name]) : '     '}  #{name}#{counts[name] ? '' : " [Not in use since #{most_recent_entry[name] || 'forever'}]"}"
+      if name.include? STATE_PLANNING_MINISTER
+        puts "#{counts[name] ? format('%5d', counts[name]) : '  N/A'}  #{name}"
+      else
+        puts "#{counts[name] ? format('%5d', counts[name]) : '     '}  #{name}#{counts[name] ? '' : " [Not in use since #{most_recent_entry[name] || 'forever'}]"}"
+      end
     end
     puts
     cleanup_old_records

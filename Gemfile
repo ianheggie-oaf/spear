@@ -8,7 +8,7 @@ source "https://rubygems.org"
 
 ruby "3.2.2"
 
+gem "httparty"
 gem "rubocop"
 gem "scraperwiki", git: "https://github.com/openaustralia/scraperwiki-ruby.git", branch: "morph_defaults"
-gem "httparty"
 gem "sqlite3", "~> 1.6.3"

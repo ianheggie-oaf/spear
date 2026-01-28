@@ -8,7 +8,8 @@ require "yaml"
 class Scraper
   # Password required to get token
   BASIC_AUTH_FOR_TOKEN = "Y2xpZW50YXBwOg=="
-  DAYS_WARNING = 50
+  DAYS_WARNING = 60
+  AUTH_TIMEOUT = 600  # 10 minutes in seconds (conservative)
 
   # Throttle block to be nice to servers we are scraping
   def throttle_block(extra_delay: 0.5)
@@ -47,7 +48,7 @@ class Scraper
     ScraperWiki.sqliteexecute("VACUUM")
   end
 
-  def applications_page(authority_id, start_row, headers)
+  def applications_page(authority_id, start_row)
     # Getting the most recently submitted applications for the particular authority
     query = {
       "data": {
@@ -168,13 +169,13 @@ class Scraper
     [number_on_page, total_no]
   end
 
-  def all_applications(authority_id, headers, &block)
+  def all_applications(authority_id, &block)
     start_row = 0
 
     loop do
       puts
       puts "  Getting row #{start_row} onwards for #{authority_id}..." if ENV["DEBUG"]
-      number_on_page, total_no = applications_page(authority_id, start_row, headers, &block)
+      number_on_page, total_no = applications_page(authority_id, start_row, &block)
       puts "  Found #{number_on_page} applications from #{authority_id}, total no = #{total_no}" if ENV["DEBUG"]
       start_row += number_on_page
       break if start_row >= total_no
@@ -184,19 +185,6 @@ class Scraper
 
   def run
     puts "Getting list of Authorities..."
-    tokens = throttle_block do
-      HTTParty.post(
-        "https://www.spear.land.vic.gov.au/spear/api/v1/oauth/token",
-        body: "username=public&password=&grant_type=password&client_id=clientapp&scope=spear_rest_api",
-        headers: { "Authorization" => "Basic #{BASIC_AUTH_FOR_TOKEN}" }
-      )
-    end
-
-    headers = {
-      "Authorization" => "Bearer #{tokens['access_token']}",
-      "Content-Type" => "application/json",
-    }
-
     authorities = throttle_block do
       HTTParty.post(
         "https://www.spear.land.vic.gov.au/spear/api/v1/site/search",
@@ -207,6 +195,7 @@ class Scraper
 
     puts "Found #{authorities['data'].size} authorities..."
     counts = {}
+    most_recent_entry = {}
     authorities["data"].each do |authority|
       next if ENV["MORPH_AUTHORITIES"] && !ENV["MORPH_AUTHORITIES"].split(",").include?(authority["name"])
 
@@ -214,10 +203,11 @@ class Scraper
       puts "Getting applications for #{authority['name']}..."
       id = authority["id"]
 
-      all_applications(id, headers) do |record|
+      all_applications(id) do |record|
         date_received = Date.parse(record["date_received"])
+        most_recent_entry[authority["name"]] ||= date_received
         if date_received < Date.today - DAYS_WARNING
-          puts "WARNING: nothing found between 28 and #{DAYS_WARNING} ago! SPEAR may not being used since #{record['date_received']}"
+          puts "WARNING: nothing found between 28 and #{DAYS_WARNING} ago! previous SPEAR record dated #{record['date_received']}"
         else
           counts[authority["name"]] ||= 0
         end
@@ -238,11 +228,39 @@ class Scraper
     puts "-----  --------------------------------------"
     authorities["data"].each do |authority|
       name = authority["name"]
-      puts "#{counts[name] ? format('%5d', counts[name]) : '     '}  #{name}#{counts[name] ? '' : " [Not in use?]"}"
+      puts "#{counts[name] ? format('%5d', counts[name]) : '     '}  #{name}#{counts[name] ? '' : " [Not in use since #{most_recent_entry[name] || 'forever'}]"}"
     end
     puts
     cleanup_old_records
     puts "Finished!"
+  end
+
+  def headers
+    if @token_expires_at.nil? || Time.now >= @token_expires_at
+      refresh_token
+    end
+
+    {
+      "Authorization" => "Bearer #{@access_token}",
+      "Content-Type" => "application/json"
+    }
+  end
+
+  private
+
+  def refresh_token
+    puts "Authenticating with SPEAR API..."
+    tokens = throttle_block do
+      HTTParty.post(
+        "https://www.spear.land.vic.gov.au/spear/api/v1/oauth/token",
+        body: "username=public&password=&grant_type=password&client_id=clientapp&scope=spear_rest_api",
+        headers: { "Authorization" => "Basic #{BASIC_AUTH_FOR_TOKEN}" }
+      )
+    end
+
+    @access_token = tokens['access_token']
+    # Set expiry - using 15 minutes to be conservative (you mentioned ~20 min actual)
+    @token_expires_at = Time.now + AUTH_TIMEOUT
   end
 end
 

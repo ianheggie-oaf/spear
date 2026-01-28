@@ -8,7 +8,7 @@ require "yaml"
 class Scraper
   # Password required to get token
   BASIC_AUTH_FOR_TOKEN = "Y2xpZW50YXBwOg=="
-  DAYS_WARNING = 60
+  DAYS_WARNING = 270  # 9 months - small rural councils will see few subdivisions
   AUTH_TIMEOUT = 600 # 10 minutes in seconds (conservative)
   STATE_PLANNING_MINISTER = "Minister for Planning" # historical?
 

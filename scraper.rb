@@ -8,6 +8,7 @@ require "yaml"
 class Scraper
   # Password required to get token
   BASIC_AUTH_FOR_TOKEN = "Y2xpZW50YXBwOg=="
+  DAYS_WARNING = 50
 
   # Throttle block to be nice to servers we are scraping
   def throttle_block(extra_delay: 0.5)
@@ -141,7 +142,9 @@ class Scraper
 
       description = detail&.dig("data", "intendedUse").to_s
       if description.empty?
-        puts "NOTE: Missing Intended Use for #{spear_reference}, using Proposal Type and Application Type instead for description"
+        if ENV['DEBUG']
+          puts "NOTE: Missing Intended Use for #{spear_reference}, using Proposal Type and Application Type instead for description"
+        end
         # puts "HTTParty response: #{detail.to_yaml}" if ENV['DEBUG']
         description = [
           detail&.dig("data", "appDisplayName"),
@@ -155,11 +158,11 @@ class Scraper
 
       yield(
         "council_reference" => a["spearReference"],
-        "address" => a["property"],
-        "description" => description,
-        "info_url" => "https://www.spear.land.vic.gov.au/spear/app/public/applications/#{application_id}/summary",
-        "date_scraped" => Date.today.to_s,
-        "date_received" => Date.strptime(a["submittedDate"], "%d/%m/%Y").to_s
+          "address" => a["property"],
+          "description" => description,
+          "info_url" => "https://www.spear.land.vic.gov.au/spear/app/public/applications/#{application_id}/summary",
+          "date_scraped" => Date.today.to_s,
+          "date_received" => Date.strptime(a["submittedDate"], "%d/%m/%Y").to_s
       )
     end
     [number_on_page, total_no]
@@ -176,6 +179,7 @@ class Scraper
       start_row += number_on_page
       break if start_row >= total_no
     end
+    puts "ERROR: Expected to find at least old applications for authority!"
   end
 
   def run
@@ -211,10 +215,15 @@ class Scraper
       id = authority["id"]
 
       all_applications(id, headers) do |record|
-        counts[authority["name"]] ||= 0
+        date_received = Date.parse(record["date_received"])
+        if date_received < Date.today - DAYS_WARNING
+          puts "WARNING: nothing found between 28 and #{DAYS_WARNING} ago! SPEAR may not being used since #{record['date_received']}"
+        else
+          counts[authority["name"]] ||= 0
+        end
         # We only want the last 28 days
-        if Date.parse(record["date_received"]) < Date.today - 28
-          puts "  Ignoring remaining rows received #{record['date_received']} and earlier ..."
+        if date_received < Date.today - 28
+          puts "  Ignoring remaining rows received #{record['date_received']} and earlier ..." if ENV['DEBUG']
           break
         end
 
@@ -229,7 +238,7 @@ class Scraper
     puts "-----  --------------------------------------"
     authorities["data"].each do |authority|
       name = authority["name"]
-      puts "#{counts[name] ? format('%5d', counts[name]) : '    -'}  #{name}"
+      puts "#{counts[name] ? format('%5d', counts[name]) : '     '}  #{name}#{counts[name] ? '' : " [Not in use?]"}"
     end
     puts
     cleanup_old_records
